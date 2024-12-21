@@ -1,0 +1,98 @@
+package main
+
+import (
+    "database/sql"
+    "encoding/json"
+    "fmt"
+    "log"
+    "net/http"
+    "sync"
+
+    stan "github.com/nats-io/stan.go"
+    _ "github.com/lib/pq"
+)
+
+var (
+    cache     = make(map[string]interface{})
+    cacheLock sync.RWMutex
+)
+
+type DataModel struct {
+    ID    string `json:"id"`
+    Field string `json:"field"`
+}
+
+var db *sql.DB
+
+func main() {
+    var err error
+    db, err = sql.Open("postgres", "host=localhost port=5432 user=myuser password=mypassword dbname=mydb sslmode=disable")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer db.Close()
+
+    sc, err := stan.Connect("test-cluster", "subscriber-client", stan.NatsURL("nats://localhost:4222"))
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer sc.Close()
+
+    sc.Subscribe("data-channel", func(m *stan.Msg) {
+        var data DataModel
+        err := json.Unmarshal(m.Data, &data)
+        if err != nil {
+            log.Println("Error parsing message:", err)
+            return
+        }
+
+        _, err = db.Exec("INSERT INTO data (id, field) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING", data.ID, data.Field)
+        if err != nil {
+            log.Println("Error writing to database:", err)
+            return
+        }
+
+        cacheLock.Lock()
+        cache[data.ID] = data
+        cacheLock.Unlock()
+    }, stan.DurableName("my-durable"))
+
+    restoreCache()
+
+    http.HandleFunc("/data", handleDataRequest)
+    http.ListenAndServe(":8080", nil)
+}
+
+func restoreCache() {
+    rows, err := db.Query("SELECT id, field FROM data")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer rows.Close()
+
+    cacheLock.Lock()
+    defer cacheLock.Unlock()
+    for rows.Next() {
+        var id, field string
+        err := rows.Scan(&id, &field)
+        if err != nil {
+            log.Println("Error restoring cache:", err)
+            continue
+        }
+        cache[id] = DataModel{ID: id, Field: field}
+    }
+}
+
+func handleDataRequest(w http.ResponseWriter, r *http.Request) {
+    id := r.URL.Query().Get("id")
+    cacheLock.RLock()
+    data, found := cache[id]
+    cacheLock.RUnlock()
+
+    if !found {
+        http.Error(w, "Data not found", http.StatusNotFound)
+        return
+    }
+
+    json.NewEncoder(w).Encode(data)
+}
