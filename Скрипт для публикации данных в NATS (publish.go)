@@ -1,0 +1,34 @@
+package main
+
+import (
+    "encoding/json"
+    "log"
+    "time"
+
+    stan "github.com/nats-io/stan.go"
+)
+
+type DataModel struct {
+    ID    string `json:"id"`
+    Field string `json:"field"`
+}
+
+func main() {
+    sc, err := stan.Connect("test-cluster", "publisher-client", stan.NatsURL("nats://localhost:4222"))
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer sc.Close()
+
+    data := DataModel{
+        ID:    "1",
+        Field: "Sample Data",
+    }
+    
+    payload, err := json.Marshal(data)
+    if err != nil {
+        log.Fatal(err)
+    }
+    sc.Publish("data-channel", payload)
+    time.Sleep(1 * time.Second)
+}
